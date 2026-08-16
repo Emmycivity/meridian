@@ -1,40 +1,14 @@
-import { createHash, timingSafeEqual } from "node:crypto";
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import {
   loadBlendAccrualKeeperConfig,
+  redactedErrorMessage,
   runBlendAccrualKeeper,
 } from "@meridian/stellar-sdk-helpers";
-import { checkRateLimit } from "../../_lib/middleware.js";
-
-function authorizationHeader(req: VercelRequest): string | undefined {
-  const raw = req.headers.authorization;
-  return Array.isArray(raw) ? raw[0] : raw;
-}
-
-// Constant-time comparison: this endpoint authorizes real signed
-// transactions, so the bearer token check shouldn't leak timing
-// information a network attacker could use to guess CRON_SECRET
-// character-by-character. Both inputs are hashed to a fixed 32-byte digest
-// first, so there's no length-based short-circuit before timingSafeEqual,
-// a naive length check up front would itself leak the secret's length via
-// timing before the constant-time comparison ever ran.
-function safeCompare(a: string, b: string): boolean {
-  const digestA = createHash("sha256").update(a).digest();
-  const digestB = createHash("sha256").update(b).digest();
-  return timingSafeEqual(digestA, digestB);
-}
-
-function isCronAuthorized(req: VercelRequest): boolean {
-  const secret = process.env.CRON_SECRET;
-  // Permissive only for true local dev (no VERCEL_ENV at all). Preview
-  // deployments have their own public URL and, unlike simple rate-limit
-  // relaxation elsewhere, this endpoint triggers real signed transactions
-  // off the keeper's funded account, so an unauthenticated preview caller
-  // could drain its balance by spamming the endpoint. Preview and
-  // production both require CRON_SECRET.
-  if (!secret) return process.env.VERCEL_ENV === undefined;
-  return safeCompare(authorizationHeader(req) ?? "", `Bearer ${secret}`);
-}
+import {
+  checkRateLimit,
+  isCronAuthorized,
+  isCronSecretConfigured,
+} from "../../_lib/middleware.js";
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== "GET" && req.method !== "POST") {
@@ -44,13 +18,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   // No applyCors: this endpoint is cron-invoked, never browser-facing. But
   // it does sign and submit real transactions off the keeper's funded
-  // account, unlike simple reads, so it still gets a rate-limit backstop:
-  // defense-in-depth if CRON_SECRET ever leaks or a non-production instance
-  // is reachable, even though the legitimate cron caller is nowhere near
-  // this limit at one call per 15 minutes.
+  // account, unlike simple reads, so it still gets a rate-limit backstop.
+  // Checked before auth, deliberately, even though that costs a Redis round
+  // trip on an unauthenticated probe: this is the volume-abuse backstop for
+  // *all* traffic, not just correctly-authenticated traffic, if it only ran
+  // after a successful auth check, unauthenticated/wrong-token spam would
+  // be entirely unbounded, since a 401 would return before this ever runs.
   if (!(await checkRateLimit(req, res))) return;
 
-  if (!process.env.CRON_SECRET && process.env.VERCEL_ENV !== undefined) {
+  if (!isCronSecretConfigured()) {
     return res.status(503).json({ error: "CRON_SECRET is not configured" });
   }
 
@@ -65,7 +41,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(status).json(result);
   } catch (err) {
     console.error("[accrual-keeper] run failed:", err);
-    const message = err instanceof Error ? err.message : "Keeper failed";
-    return res.status(500).json({ error: message });
+    return res.status(500).json({ error: redactedErrorMessage(err) });
   }
 }

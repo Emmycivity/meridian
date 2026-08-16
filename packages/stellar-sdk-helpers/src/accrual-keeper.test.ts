@@ -77,6 +77,15 @@ vi.mock("./internal", async (importOriginal) => {
 });
 
 vi.mock("./tx", () => ({
+  describeSendError: (res: {
+    errorResult?: { result(): { switch(): { name: string } } };
+  }) => {
+    try {
+      return res.errorResult?.result().switch().name ?? "unknown error";
+    } catch {
+      return "unknown error";
+    }
+  },
   simErrorMessage: (error: unknown) => String(error),
   simulateView: stellarMocks.simulateView,
   waitForTransaction: stellarMocks.waitForTransaction,
@@ -909,6 +918,28 @@ describe("runBlendAccrualKeeper", () => {
     );
   });
 
+  it("redacts an RPC URL leaking into a submission failure's message before it reaches the API response", async () => {
+    // KeeperFailure.error flows straight into /api/v1/keepers/accrue's JSON
+    // response; an underlying SDK error message could otherwise leak
+    // infrastructure details (RPC URLs, contract addresses) to whoever can
+    // read that response.
+    const result = await runBlendAccrualKeeper(CONFIG, {
+      discoverAdapters: async () => ({
+        adapters: [BLEND_ADAPTER],
+        failures: [],
+      }),
+      submitAccrual: vi.fn(async () => {
+        throw new Error(
+          "connect ECONNREFUSED https://rpc.internal.example:8443/soroban"
+        );
+      }),
+    });
+
+    expect(result.failures).toMatchObject([
+      { error: "Keeper operation failed" },
+    ]);
+  });
+
   it("submits accruals through the default Stellar transaction path", async () => {
     const server = makeServer({
       sendTransaction: vi.fn(async () => ({
@@ -1264,6 +1295,10 @@ describe("runBlendAccrualKeeper", () => {
   });
 
   it("stops retrying once the next attempt would run past the deadline, instead of sleeping into it", async () => {
+    // Fake timers freeze Date.now(), so the 1ms margin below is a
+    // deterministic boundary, not a race against real execution time (a
+    // real-clock version of this test was flaky under load).
+    vi.useFakeTimers();
     const sleep = vi.fn();
     const submitAccrual = vi
       .fn()

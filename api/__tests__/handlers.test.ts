@@ -5,6 +5,13 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 // contract (method guards, field validation, status codes, payload shape), not
 // the Soroban transaction building, which is unit-tested in the helpers package.
 vi.mock("@meridian/stellar-sdk-helpers", () => ({
+  redactedErrorMessage: vi.fn((err: unknown) => {
+    if (!(err instanceof Error)) return "Keeper operation failed";
+    const first = err.message.split("\n")[0]?.trim();
+    if (!first || /https?:\/\/|C[A-Z2-7]{50,}/.test(first))
+      return "Keeper operation failed";
+    return first;
+  }),
   buildDepositTx: vi.fn(async () => ({ xdr: "DEPOSIT_XDR", fee: "100" })),
   buildWithdrawTx: vi.fn(async () => ({ xdr: "WITHDRAW_XDR", fee: "100" })),
   buildAddTrustlineTx: vi.fn(async () => ({ xdr: "TRUST_XDR" })),
@@ -38,6 +45,33 @@ vi.mock("@meridian/stellar-sdk-helpers", () => ({
     skipped: [],
     failures: [],
   })),
+  isMigrationKeeperConfigured: vi.fn(
+    (env: Record<string, string | undefined>) =>
+      Boolean(env.MERIDIAN_MIGRATION_KEEPER_SECRET_KEY?.trim())
+  ),
+  loadMigrationKeeperConfig: vi.fn(() => ({
+    network: {
+      network: "testnet",
+      rpcUrl: "https://rpc.example",
+      passphrase: "Test SDF Network ; September 2015",
+    },
+    secretKey: "SECRET",
+    maxAttempts: 3,
+    baseDelayMs: 1,
+    rpcTimeoutMs: 100,
+    minImprovementBps: 50,
+    maxSlippageBps: 100,
+    candidateAdapters: {},
+  })),
+  runMigrationKeeper: vi.fn(async () => ({
+    network: "testnet",
+    startedAt: "2026-08-06T00:00:00.000Z",
+    finishedAt: "2026-08-06T00:00:01.000Z",
+    discoveredVaults: 1,
+    migrations: [],
+    skipped: [{ vaultId: "meridian-usdc", reason: "current rate unavailable" }],
+    failures: [],
+  })),
   fetchAllVaults: vi.fn(async () => [
     { id: "blend-usdc-fixed", protocol: "blend" },
   ]),
@@ -61,9 +95,12 @@ import submitHandler from "../v1/tx/submit";
 import vaultsHandler from "../v1/vaults/index";
 import positionsHandler from "../v1/positions/[publicKey]";
 import keeperHandler from "../v1/keepers/accrue";
+import rebalanceHandler from "../v1/keepers/rebalance";
+import { resetRateLimitForTesting } from "../_lib/middleware.js";
 import {
   buildDepositTx,
   runBlendAccrualKeeper,
+  runMigrationKeeper,
   resolvePositions,
 } from "@meridian/stellar-sdk-helpers";
 
@@ -105,6 +142,7 @@ function makeRes(): FakeRes & VercelResponse {
 beforeEach(() => {
   vi.clearAllMocks();
   process.env.CRON_SECRET = "cron-secret";
+  process.env.MERIDIAN_MIGRATION_KEEPER_SECRET_KEY = "S".repeat(56);
 });
 
 describe("POST /api/v1/tx/deposit", () => {
@@ -299,6 +337,29 @@ describe("GET /api/v1/keepers/accrue", () => {
     expect(runBlendAccrualKeeper).not.toHaveBeenCalled();
   });
 
+  it("still rate-limits requests that fail auth, not just successful ones", async () => {
+    // Regression test: rate-limiting must run before auth, not after.
+    // Unauthenticated/wrong-token spam that returns 401 before the limiter
+    // ever runs would be completely unbounded, since 401 responses would
+    // never count toward the limit.
+    resetRateLimitForTesting();
+    const ip = "203.0.113.50";
+    let lastRes = makeRes();
+    for (let i = 0; i < 101; i++) {
+      lastRes = makeRes();
+      await keeperHandler(
+        fakeReq({
+          method: "GET",
+          headers: { "x-forwarded-for": ip },
+        }),
+        lastRes
+      );
+    }
+
+    expect(lastRes.statusCode).toBe(429);
+    resetRateLimitForTesting();
+  });
+
   it("runs the accrual keeper for authorized cron calls", async () => {
     const res = makeRes();
     await keeperHandler(
@@ -348,6 +409,24 @@ describe("GET /api/v1/keepers/accrue", () => {
     expect(res.body).toMatchObject({
       failures: [{ vaultId: "meridian-usdc", error: "try again later" }],
     });
+  });
+
+  it("redacts an unexpected keeper-run error instead of leaking it raw", async () => {
+    vi.mocked(runBlendAccrualKeeper).mockRejectedValueOnce(
+      new Error("connect ECONNREFUSED https://rpc.internal.example:443")
+    );
+
+    const res = makeRes();
+    await keeperHandler(
+      fakeReq({
+        method: "GET",
+        headers: { authorization: "Bearer cron-secret" },
+      }),
+      res
+    );
+
+    expect(res.statusCode).toBe(500);
+    expect(res.body).toEqual({ error: "Keeper operation failed" });
   });
 
   describe("without CRON_SECRET configured", () => {
@@ -406,5 +485,124 @@ describe("GET /api/v1/keepers/accrue", () => {
       expect(res.statusCode).toBe(503);
       expect(runBlendAccrualKeeper).not.toHaveBeenCalled();
     });
+  });
+});
+
+describe("GET /api/v1/keepers/rebalance", () => {
+  it("reports disabled instead of a noisy 500 when the migration secret key isn't configured", async () => {
+    delete process.env.MERIDIAN_MIGRATION_KEEPER_SECRET_KEY;
+    const res = makeRes();
+    await rebalanceHandler(
+      fakeReq({
+        method: "GET",
+        headers: { authorization: "Bearer cron-secret" },
+      }),
+      res
+    );
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({ status: "disabled" });
+    expect(runMigrationKeeper).not.toHaveBeenCalled();
+  });
+
+  it("rejects requests without the cron bearer token", async () => {
+    const res = makeRes();
+    await rebalanceHandler(fakeReq({ method: "GET", headers: {} }), res);
+
+    expect(res.statusCode).toBe(401);
+    expect(runMigrationKeeper).not.toHaveBeenCalled();
+  });
+
+  it("still rate-limits requests that fail auth, not just successful ones", async () => {
+    // Same regression as the accrue keeper's equivalent test, higher
+    // stakes here: this endpoint holds full vault admin authority.
+    resetRateLimitForTesting();
+    const ip = "203.0.113.51";
+    let lastRes = makeRes();
+    for (let i = 0; i < 101; i++) {
+      lastRes = makeRes();
+      await rebalanceHandler(
+        fakeReq({
+          method: "GET",
+          headers: { "x-forwarded-for": ip },
+        }),
+        lastRes
+      );
+    }
+
+    expect(lastRes.statusCode).toBe(429);
+    resetRateLimitForTesting();
+  });
+
+  it("runs the migration keeper for authorized cron calls", async () => {
+    const res = makeRes();
+    await rebalanceHandler(
+      fakeReq({
+        method: "GET",
+        headers: { authorization: "Bearer cron-secret" },
+      }),
+      res
+    );
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({
+      skipped: [
+        { vaultId: "meridian-usdc", reason: "current rate unavailable" },
+      ],
+    });
+    expect(runMigrationKeeper).toHaveBeenCalledOnce();
+  });
+
+  it("returns 500 when a migration fails so the cron run is observable", async () => {
+    vi.mocked(runMigrationKeeper).mockResolvedValueOnce({
+      network: "testnet",
+      startedAt: "2026-08-06T00:00:00.000Z",
+      finishedAt: "2026-08-06T00:00:01.000Z",
+      discoveredVaults: 1,
+      migrations: [],
+      skipped: [],
+      failures: [
+        {
+          vaultId: "meridian-usdc",
+          adapterId: "CDEFINDEXADAPTER",
+          stage: "submit",
+          attempts: 3,
+          transient: true,
+          error: "try again later",
+        },
+      ],
+    });
+
+    const res = makeRes();
+    await rebalanceHandler(
+      fakeReq({
+        method: "GET",
+        headers: { authorization: "Bearer cron-secret" },
+      }),
+      res
+    );
+
+    expect(res.statusCode).toBe(500);
+    expect(res.body).toMatchObject({
+      failures: [{ vaultId: "meridian-usdc", error: "try again later" }],
+    });
+  });
+
+  it("redacts an unexpected keeper-run error instead of leaking it raw", async () => {
+    vi.mocked(runMigrationKeeper).mockRejectedValueOnce(
+      new Error("connect ECONNREFUSED https://rpc.internal.example:443")
+    );
+
+    const res = makeRes();
+    await rebalanceHandler(
+      fakeReq({
+        method: "GET",
+        headers: { authorization: "Bearer cron-secret" },
+      }),
+      res
+    );
+
+    expect(res.statusCode).toBe(500);
+    expect(res.body).toEqual({ error: "Keeper operation failed" });
   });
 });
