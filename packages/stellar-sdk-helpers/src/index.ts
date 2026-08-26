@@ -11,6 +11,7 @@ export * from "./known-pools";
 export * from "./migration-keeper";
 export * from "./orchestration";
 export * from "./positions";
+export * from "./rate-sources";
 export * from "./routing";
 export * from "./tx";
 export * from "./types";
