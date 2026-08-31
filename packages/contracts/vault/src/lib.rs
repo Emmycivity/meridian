@@ -39,6 +39,10 @@ pub trait YieldAdapterInterface {
     fn deposit(env: Env, amount: i128) -> i128;
     fn withdraw(env: Env, shares: i128, recipient: Address) -> i128;
     fn total_assets(env: Env) -> i128;
+    /// The adapter's current protocol-share balance, read from the underlying
+    /// protocol's own ledger rather than self-tracked. Lets the vault reconcile
+    /// ADPT_SH instead of estimating its decrements.
+    fn total_shares(env: Env) -> i128;
     /// Refreshes the adapter's cached total_assets before it is read for
     /// deposit/withdraw pricing. A no-op for adapters that already price
     /// live on every call.
@@ -222,7 +226,6 @@ impl MeridianVault {
             .get(&ADAPTER)
             .ok_or(ContractError::NotInitialized)?;
         let total_shares: i128 = env.storage().instance().get(&TOTAL_SH).unwrap_or(0);
-        let total_adapter_shares: i128 = env.storage().instance().get(&ADPT_SH).unwrap_or(0);
 
         // Refresh the adapter's cached total before pricing so this
         // depositor's own transaction is priced with up-to-date yield.
@@ -276,7 +279,8 @@ impl MeridianVault {
         TokenClient::new(&env, &usdc).transfer(&caller, &adapter_addr, &amount);
 
         // Adapter deploys USDC to the underlying protocol and returns its own shares.
-        let adapter_shares = AdapterClient::new(&env, &adapter_addr).deposit(&amount);
+        let adapter_client = AdapterClient::new(&env, &adapter_addr);
+        let _adapter_shares = adapter_client.deposit(&amount);
 
         // Mint mUSDC shares to caller.
         MusdcAdminClient::new(&env, &musdc).mint(&caller, &shares_to_mint);
@@ -287,7 +291,7 @@ impl MeridianVault {
             .set(&TOTAL_SH, &(total_shares + shares_to_mint));
         env.storage()
             .instance()
-            .set(&ADPT_SH, &(total_adapter_shares + adapter_shares));
+            .set(&ADPT_SH, &adapter_client.total_shares());
 
         // Stamp the entry time on the caller's first deposit; top-ups keep
         // the original time. Keyed off whether an entry record exists rather
@@ -376,8 +380,9 @@ impl MeridianVault {
             .ok_or(ContractError::Overflow)?;
 
         // Adapter redeems protocol shares, delivers USDC to vault, returns amount.
-        let usdc_out = AdapterClient::new(&env, &adapter_addr)
-            .withdraw(&adapter_shares_to_burn, &env.current_contract_address());
+        let adapter_client = AdapterClient::new(&env, &adapter_addr);
+        let usdc_out =
+            adapter_client.withdraw(&adapter_shares_to_burn, &env.current_contract_address());
 
         if usdc_out <= 0 {
             return Err(ContractError::WithdrawalTooSmall);
@@ -400,7 +405,7 @@ impl MeridianVault {
             .set(&TOTAL_SH, &(total_shares - shares));
         env.storage()
             .instance()
-            .set(&ADPT_SH, &(total_adapter_shares - adapter_shares_to_burn));
+            .set(&ADPT_SH, &adapter_client.total_shares());
 
         let remaining = caller_shares - shares;
 
@@ -865,7 +870,9 @@ impl MeridianVault {
         }
 
         env.storage().instance().set(&ADAPTER, &new_adapter);
-        env.storage().instance().set(&ADPT_SH, &new_shares);
+        env.storage()
+            .instance()
+            .set(&ADPT_SH, &new_adapter_client.total_shares());
         Ok(())
     }
 
@@ -1106,6 +1113,10 @@ mod tests {
             mock_total_assets(&env, &usdc)
         }
 
+        pub fn total_shares(env: Env) -> i128 {
+            env.storage().instance().get(&MA_SH).unwrap_or(0)
+        }
+
         pub fn refresh(_env: Env) {
             // No-op: MockAdapter already prices total_assets() live.
         }
@@ -1165,6 +1176,10 @@ mod tests {
                 mock_total_assets(&env, &usdc)
             }
 
+            pub fn total_shares(env: Env) -> i128 {
+                env.storage().instance().get(&LA_SH).unwrap_or(0)
+            }
+
             pub fn refresh(_env: Env) {
                 // No-op: LossyMockAdapter already prices total_assets() live.
             }
@@ -1214,6 +1229,10 @@ mod tests {
                 let usdc: Address =
                     get_or_not_initialized(&env, env.storage().instance().get(&ZS_USDC));
                 mock_total_assets(&env, &usdc)
+            }
+
+            pub fn total_shares(env: Env) -> i128 {
+                env.storage().instance().get(&ZS_SH).unwrap_or(0)
             }
 
             pub fn refresh(_env: Env) {
@@ -1289,6 +1308,10 @@ mod tests {
                 // Instance storage read defaults to 0 if CM_TOTAL hasn't been set, which is safe since
                 // initialize() sets this key to 0.
                 env.storage().instance().get(&CM_TOTAL).unwrap_or(0)
+            }
+
+            pub fn total_shares(env: Env) -> i128 {
+                env.storage().instance().get(&CM_SH).unwrap_or(0)
             }
 
             pub fn refresh(env: Env) {
@@ -2145,6 +2168,49 @@ mod tests {
         // the vault isn't left with ADPT_SH desynced from TOTAL_SH.
         assert_eq!(vault.get_adapter(), adapter);
         assert_eq!(vault.get_total_assets(), amount);
+    }
+
+    #[test]
+    fn deposit_reconciles_drifted_adpt_sh_to_the_adapter_s_real_balance() {
+        // Regression test for issue #556: ADPT_SH used to be maintained by
+        // locally incrementing/decrementing an estimate, which could drift
+        // from the adapter's real share balance over many operations. This
+        // fix instead reconciles ADPT_SH to adapter_client.total_shares()
+        // after every deposit/withdraw. Simulate a vault that already has
+        // pre-existing drift (e.g. from rounding accumulated before this fix
+        // shipped) by directly corrupting the stored counter, then prove the
+        // very next deposit snaps it back to ground truth instead of
+        // compounding on the wrong value.
+        let (env, _admin, user, _usdc, _musdc, adapter, vault) = setup();
+        let amount = 100_0000000_i128;
+        vault.deposit(&user, &amount);
+
+        // Corrupt the stored counter so it disagrees with the adapter's real
+        // balance (which is `amount`, per MockAdapter's deposit()).
+        let drifted_value = amount + 42_0000000_i128;
+        env.as_contract(&vault.address, || {
+            env.storage()
+                .instance()
+                .set(&Symbol::new(&env, "ADPT_SH"), &drifted_value);
+        });
+
+        // A second deposit should reconcile ADPT_SH to the adapter's real
+        // total_shares(), not to drifted_value + this deposit's shares.
+        let second_amount = 50_0000000_i128;
+        vault.deposit(&user, &second_amount);
+
+        let adapter_real_shares = MockAdapterClient::new(&env, &adapter).total_shares();
+        let stored_adpt_sh: i128 = env.as_contract(&vault.address, || {
+            env.storage()
+                .instance()
+                .get(&Symbol::new(&env, "ADPT_SH"))
+                .unwrap()
+        });
+        assert_eq!(
+            stored_adpt_sh, adapter_real_shares,
+            "ADPT_SH must reconcile to the adapter's real balance, not remain drifted"
+        );
+        assert_eq!(stored_adpt_sh, amount + second_amount);
     }
 
     #[test]

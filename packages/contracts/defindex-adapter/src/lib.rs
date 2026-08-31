@@ -199,6 +199,18 @@ impl MeridianDefindexAdapter {
         }
     }
 
+    /// Returns the adapter's current dfToken share balance read directly from
+    /// the DeFindex vault's ledger.
+    pub fn total_shares(env: Env) -> i128 {
+        let dfx: Address = adapter_common::get_or_not_initialized::<_, ContractError>(
+            &env,
+            env.storage().instance().get(&DFX_VAULT),
+        );
+        let adapter = env.current_contract_address();
+
+        DefindexVaultClient::new(&env, &dfx).balance(&adapter)
+    }
+
     /// No-op: DeFindex's total_assets() already prices live on every call
     /// via the vault's exchange rate, so there is no cache to refresh.
     pub fn refresh(_env: Env) {}
@@ -411,6 +423,21 @@ mod tests {
 
         assert_eq!(shares, amount);
         assert_eq!(adapter.total_assets(), amount);
+    }
+
+    #[test]
+    fn total_shares_reads_the_dfx_vault_s_live_balance() {
+        let (env, vault, usdc_id, adapter, _dfx) = setup();
+        assert_eq!(adapter.total_shares(), 0);
+
+        let amount = 100_0000000_i128;
+        TokenClient::new(&env, &usdc_id).transfer(&vault, &adapter.address, &amount);
+        let shares = adapter.deposit(&amount);
+
+        // total_shares() reads the DeFindex vault's own balance() live,
+        // independent of anything the vault separately tracks -- it must
+        // agree with the dfToken credit deposit() itself just returned.
+        assert_eq!(adapter.total_shares(), shares);
     }
 
     #[test]
